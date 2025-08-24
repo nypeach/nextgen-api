@@ -2,18 +2,18 @@
 Base service class for NextGen API services.
 Provides common functionality for making authenticated API requests.
 """
+
 import logging
 from typing import Dict, Any, Optional, Union, List
-from urllib.parse import urljoin
 import requests
 
-from ..auth.oauth_client import NextGenOAuthClient
-from ..config import NextGenConfig, get_config
 from ..exceptions.nextgen_exceptions import (
-    NextGenAPIError, ServerError, ClientError, NetworkError,
-    RateLimitError, ValidationError
+    NextGenAPIError,
+    ClientError,
+    ServerError,
+    RateLimitError,
+    NetworkError
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -21,319 +21,193 @@ logger = logging.getLogger(__name__)
 class BaseService:
     """Base class for all NextGen API services."""
 
-    def __init__(self, config: Optional[NextGenConfig] = None, oauth_client: Optional[NextGenOAuthClient] = None):
+    def __init__(self, client):
         """
-        Initialize the service.
+        Initialize the base service.
 
         Args:
-            config: NextGen API configuration. If None, will load from environment.
-            oauth_client: OAuth client for authentication. If None, will create one.
+            client: NextGenClient instance
         """
-        self.config = config or get_config()
-        self.oauth_client = oauth_client or NextGenOAuthClient(self.config)
-        self._session = requests.Session()
+        self.client = client
+        self.config = client.config
+        self.oauth_client = client.oauth_client
 
-        # Set up session with default headers
-        self._session.headers.update({
+    def _make_request(self,
+                     method: str,
+                     endpoint: str,
+                     params: Optional[Dict[str, Any]] = None,
+                     json_data: Optional[Dict[str, Any]] = None,
+                     headers: Optional[Dict[str, str]] = None) -> Union[Dict, List, str]:
+        """
+        Make an authenticated request to the NextGen API.
+
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE)
+            endpoint: API endpoint (will be appended to base_url)
+            params: Query parameters
+            json_data: JSON data for POST/PUT requests
+            headers: Additional headers
+
+        Returns:
+            Response data (parsed JSON or raw text)
+
+        Raises:
+            NextGenAPIError: For various API errors
+        """
+        # Construct full URL
+        if endpoint.startswith('/'):
+            url = f"{self.config.base_url}{endpoint}"
+        else:
+            url = f"{self.config.base_url}/{endpoint}"
+
+        # Get authentication headers
+        auth_headers = self.oauth_client.get_auth_headers()
+
+        # Merge with additional headers
+        request_headers = {
             'User-Agent': self.config.user_agent,
             'Accept': self.config.accept,
             'Accept-Encoding': self.config.accept_encoding,
             'Connection': self.config.connection,
-        })
+        }
+        request_headers.update(auth_headers)
 
-        # Configure SSL verification and redirects
-        self._session.verify = self.config.verify_ssl
-        if hasattr(self._session, 'max_redirects'):
-            self._session.max_redirects = 10 if self.config.follow_redirects else 0
+        if headers:
+            request_headers.update(headers)
 
-    def _build_url(self, endpoint: str) -> str:
-        """
-        Build full URL from endpoint path.
-
-        Args:
-            endpoint: API endpoint path (e.g., '/master/codes')
-
-        Returns:
-            Full URL for the API request
-        """
-        # Remove leading slash if present to avoid double slashes
-        endpoint = endpoint.lstrip('/')
-        return urljoin(self.config.base_url + '/', endpoint)
-
-    def _get_request_headers(self, additional_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        """
-        Get headers for API requests including authentication.
-
-        Args:
-            additional_headers: Additional headers to include
-
-        Returns:
-            Dictionary of headers for the request
-        """
-        headers = self.oauth_client.get_auth_headers()
-
-        if additional_headers:
-            headers.update(additional_headers)
-
-        return headers
-
-    def _handle_response(self, response: requests.Response) -> Dict[str, Any]:
-        """
-        Handle API response and raise appropriate exceptions for errors.
-
-        Args:
-            response: requests Response object
-
-        Returns:
-            Parsed JSON response data
-
-        Raises:
-            NextGenAPIError: For various API error conditions
-        """
-        # Log response details for debugging
-        logger.debug(f"Response status: {response.status_code}")
-        logger.debug(f"Response headers: {dict(response.headers)}")
-
-        # Handle successful responses
-        if 200 <= response.status_code < 300:
-            try:
-                return response.json()
-            except ValueError as e:
-                logger.error(f"Failed to parse JSON response: {e}")
-                logger.error(f"Response content: {response.text}")
-                raise NextGenAPIError(
-                    f"Invalid JSON response: {e}",
-                    status_code=response.status_code,
-                    response_data={'raw_content': response.text}
-                )
-
-        # Try to parse error response
-        error_data = {}
-        try:
-            error_data = response.json()
-        except ValueError:
-            error_data = {'raw_content': response.text}
-
-        # Handle specific error status codes
-        if response.status_code == 401:
-            # Force token refresh on next request
-            self.oauth_client.revoke_token()
-            raise ClientError(
-                "Authentication failed - token may be invalid",
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-        elif response.status_code == 403:
-            raise ClientError(
-                "Access forbidden - insufficient permissions",
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-        elif response.status_code == 404:
-            raise ClientError(
-                "Resource not found",
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-        elif response.status_code == 429:
-            raise RateLimitError(
-                "Rate limit exceeded",
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-        elif 400 <= response.status_code < 500:
-            error_message = error_data.get('message', f'Client error: {response.status_code}')
-            raise ClientError(
-                error_message,
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-        elif 500 <= response.status_code < 600:
-            error_message = error_data.get('message', f'Server error: {response.status_code}')
-            raise ServerError(
-                error_message,
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-        else:
-            raise NextGenAPIError(
-                f"Unexpected response status: {response.status_code}",
-                status_code=response.status_code,
-                response_data=error_data
-            )
-
-    def _make_request(
-        self,
-        method: str,
-        endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
-        json_data: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Make an authenticated API request.
-
-        Args:
-            method: HTTP method (GET, POST, PUT, DELETE, etc.)
-            endpoint: API endpoint path
-            params: Query parameters
-            data: Form data for the request body
-            json_data: JSON data for the request body
-            headers: Additional headers
-            timeout: Request timeout in seconds
-
-        Returns:
-            Parsed JSON response data
-
-        Raises:
-            NextGenAPIError: For various API error conditions
-        """
-        url = self._build_url(endpoint)
-        request_headers = self._get_request_headers(headers)
-        request_timeout = timeout or self.config.timeout
+        # Add Content-Type for JSON requests
+        if json_data:
+            request_headers['Content-Type'] = 'application/json'
 
         logger.debug(f"Making {method} request to {url}")
-        logger.debug(f"Headers: {request_headers}")
+        logger.debug(f"Headers: {list(request_headers.keys())}")
         logger.debug(f"Params: {params}")
-        logger.debug(f"Data: {data}")
-        logger.debug(f"JSON: {json_data}")
 
         try:
-            response = self._session.request(
+            response = requests.request(
                 method=method,
                 url=url,
                 params=params,
-                data=data,
                 json=json_data,
                 headers=request_headers,
-                timeout=request_timeout
+                timeout=self.config.timeout,
+                verify=self.config.verify_ssl
             )
+
+            # Log response details
+            logger.debug(f"Response status: {response.status_code}")
+            logger.debug(f"Response headers: {dict(response.headers)}")
 
             return self._handle_response(response)
 
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Request timeout: {e}")
-            raise NetworkError(f"Request timeout: {e}")
-
+        except requests.exceptions.Timeout:
+            raise NetworkError("Request timed out")
         except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error: {e}")
             raise NetworkError(f"Connection error: {e}")
-
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request error: {e}")
-            raise NetworkError(f"Request error: {e}")
+            raise NetworkError(f"Request failed: {e}")
 
-    def get(
-        self,
-        endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
+    def _handle_response(self, response: requests.Response) -> Union[Dict, List, str]:
         """
-        Make a GET request.
+        Handle the HTTP response and extract data.
 
         Args:
-            endpoint: API endpoint path
-            params: Query parameters
-            headers: Additional headers
-            timeout: Request timeout in seconds
+            response: requests.Response object
 
         Returns:
-            Parsed JSON response data
-        """
-        return self._make_request('GET', endpoint, params=params, headers=headers, timeout=timeout)
+            Parsed response data
 
-    def post(
-        self,
-        endpoint: str,
-        data: Optional[Dict[str, Any]] = None,
-        json_data: Optional[Dict[str, Any]] = None,
-        params: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
+        Raises:
+            NextGenAPIError: For various API errors
         """
-        Make a POST request.
+        # Handle different status codes
+        if response.status_code == 200:
+            return self._parse_response_data(response)
+        elif response.status_code == 401:
+            # Token might be expired, try to refresh
+            logger.warning("Received 401, attempting token refresh")
+            try:
+                self.oauth_client._refresh_token()
+                # Don't retry automatically - let the caller handle it
+                raise ClientError("Unauthorized - token may need refresh",
+                                status_code=401,
+                                response_data=self._get_error_data(response))
+            except Exception as e:
+                raise ClientError(f"Authentication failed: {e}",
+                                status_code=401,
+                                response_data=self._get_error_data(response))
+        elif response.status_code == 403:
+            raise ClientError("Forbidden - insufficient permissions",
+                            status_code=403,
+                            response_data=self._get_error_data(response))
+        elif response.status_code == 404:
+            raise ClientError("Not found",
+                            status_code=404,
+                            response_data=self._get_error_data(response))
+        elif response.status_code == 429:
+            raise RateLimitError("Rate limit exceeded",
+                               status_code=429,
+                               response_data=self._get_error_data(response))
+        elif 400 <= response.status_code < 500:
+            raise ClientError(f"Client error: {response.status_code}",
+                            status_code=response.status_code,
+                            response_data=self._get_error_data(response))
+        elif 500 <= response.status_code < 600:
+            raise ServerError(f"Server error: {response.status_code}",
+                            status_code=response.status_code,
+                            response_data=self._get_error_data(response))
+        else:
+            raise NextGenAPIError(f"Unexpected status code: {response.status_code}",
+                                status_code=response.status_code,
+                                response_data=self._get_error_data(response))
+
+    def _parse_response_data(self, response: requests.Response) -> Union[Dict, List, str]:
+        """Parse response data based on content type."""
+        content_type = response.headers.get('content-type', '').lower()
+
+        if 'application/json' in content_type:
+            try:
+                return response.json()
+            except ValueError as e:
+                logger.warning(f"Failed to parse JSON response: {e}")
+                return response.text
+        else:
+            return response.text
+
+    def _get_error_data(self, response: requests.Response) -> Dict[str, Any]:
+        """Extract error data from response."""
+        try:
+            return response.json()
+        except ValueError:
+            return {'error_text': response.text}
+
+    def _build_url(self, endpoint: str) -> str:
+        """
+        Build full URL from endpoint.
 
         Args:
-            endpoint: API endpoint path
-            data: Form data for the request body
-            json_data: JSON data for the request body
-            params: Query parameters
-            headers: Additional headers
-            timeout: Request timeout in seconds
+            endpoint: API endpoint
 
         Returns:
-            Parsed JSON response data
+            Full URL
         """
-        return self._make_request(
-            'POST', endpoint, params=params, data=data,
-            json_data=json_data, headers=headers, timeout=timeout
-        )
+        if endpoint.startswith('/'):
+            return f"{self.config.base_url}{endpoint}"
+        else:
+            return f"{self.config.base_url}/{endpoint}"
 
-    def put(
-        self,
-        endpoint: str,
-        data: Optional[Dict[str, Any]] = None,
-        json_data: Optional[Dict[str, Any]] = None,
-        params: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Make a PUT request.
+    def _log_request(self, method: str, url: str, **kwargs):
+        """Log request details."""
+        logger.info(f"{method} {url}")
+        if kwargs.get('params'):
+            logger.debug(f"Query params: {kwargs['params']}")
+        if kwargs.get('json'):
+            logger.debug(f"JSON data: {kwargs['json']}")
 
-        Args:
-            endpoint: API endpoint path
-            data: Form data for the request body
-            json_data: JSON data for the request body
-            params: Query parameters
-            headers: Additional headers
-            timeout: Request timeout in seconds
-
-        Returns:
-            Parsed JSON response data
-        """
-        return self._make_request(
-            'PUT', endpoint, params=params, data=data,
-            json_data=json_data, headers=headers, timeout=timeout
-        )
-
-    def delete(
-        self,
-        endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Make a DELETE request.
-
-        Args:
-            endpoint: API endpoint path
-            params: Query parameters
-            headers: Additional headers
-            timeout: Request timeout in seconds
-
-        Returns:
-            Parsed JSON response data
-        """
-        return self._make_request('DELETE', endpoint, params=params, headers=headers, timeout=timeout)
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        if hasattr(self, '_session'):
-            self._session.close()
+    def _log_response(self, response: requests.Response):
+        """Log response details."""
+        logger.info(f"Response: {response.status_code}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Response headers: {dict(response.headers)}")
+            if response.text:
+                logger.debug(f"Response body: {response.text[:500]}...")  # First 500 chars
